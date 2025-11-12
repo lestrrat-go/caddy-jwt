@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v3/jwt"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 )
@@ -84,10 +84,10 @@ func init() {
 func generateJWK() jwk.Key {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	panicOnError(err)
-	key, err := jwk.FromRaw(privateKey)
+	key, err := jwk.Import(privateKey)
 	panicOnError(err)
 	jwk.AssignKeyID(key)                       // set "kid"
-	key.Set(jwk.AlgorithmKey, jwa.RS256)       // set "alg"
+	key.Set(jwk.AlgorithmKey, jwa.RS256())     // set "alg"
 	key.Set(jwk.KeyUsageKey, jwk.ForSignature) // set "use"
 	return key
 }
@@ -96,10 +96,10 @@ func generateEdDSAJWK() jwk.Key {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	panicOnError(err)
 	TestSignKeyEd25519 = base64.StdEncoding.EncodeToString(publicKey)
-	key, err := jwk.FromRaw(privateKey)
+	key, err := jwk.Import(privateKey)
 	panicOnError(err)
 	jwk.AssignKeyID(key)
-	key.Set(jwk.AlgorithmKey, jwa.EdDSA)
+	key.Set(jwk.AlgorithmKey, jwa.EdDSA())
 	key.Set(jwk.KeyUsageKey, jwk.ForSignature)
 	return key
 }
@@ -139,7 +139,7 @@ func buildToken(claims MapClaims) jwt.Token {
 // using HS256 signing algorithm.
 func issueTokenString(claims MapClaims) string {
 	token := buildToken(claims)
-	tokenBytes, err := jwt.Sign(token, jwt.WithKey(jwa.HS256, RawTestSignKey))
+	tokenBytes, err := jwt.Sign(token, jwt.WithKey(jwa.HS256(), RawTestSignKey))
 	panicOnError(err)
 
 	return string(tokenBytes)
@@ -149,7 +149,7 @@ func issueTokenString(claims MapClaims) string {
 // using EdDSA signing algorithm.
 func issueTokenStringEdDSA(claims MapClaims) string {
 	token := buildToken(claims)
-	tokenBytes, err := jwt.Sign(token, jwt.WithKey(jwa.EdDSA, jwkKeyEd25519))
+	tokenBytes, err := jwt.Sign(token, jwt.WithKey(jwa.EdDSA(), jwkKeyEd25519))
 	panicOnError(err)
 
 	return string(tokenBytes)
@@ -159,7 +159,7 @@ func issueTokenStringJWK(claims MapClaims, options ...func(*jwt.SignOption)) str
 	token := buildToken(claims)
 
 	// Options par défaut
-	signOptions := []jwt.SignOption{jwt.WithKey(jwa.RS256, jwkKey)}
+	signOptions := []jwt.SignOption{jwt.WithKey(jwa.RS256(), jwkKey)}
 
 	// Appliquer les options supplémentaires
 	for _, opt := range options {
@@ -241,7 +241,7 @@ func TestAuthenticate_FromAuthorizationHeader(t *testing.T) {
 
 func TestAuthenticate_EdDSA(t *testing.T) {
 	claims := MapClaims{"sub": "ggicci"}
-	ja := &JWTAuth{SignKey: TestSignKeyEd25519, SignAlgorithm: string(jwa.EdDSA), logger: testLogger}
+	ja := &JWTAuth{SignKey: TestSignKeyEd25519, SignAlgorithm: jwa.EdDSA().String(), logger: testLogger}
 	assert.Nil(t, ja.Validate())
 
 	rw := httptest.NewRecorder()
@@ -802,11 +802,12 @@ func TestJWK(t *testing.T) {
 	assert.Equal(t, User{ID: "ggicci"}, gotUser)
 
 	// Vérifier que le cache a bien été créé pour l'URL
-	assert.NotNil(t, ja.jwkCaches)
-	cachedEntry, exists := ja.jwkCaches[TestJWKURL]
+	assert.NotNil(t, ja.jwkCache)
+	assert.NotNil(t, ja.jwkCacheSets)
+	cachedSet, exists := ja.jwkCacheSets[TestJWKURL]
 	assert.True(t, exists, "Le cache devrait exister pour l'URL de test")
-	assert.NotNil(t, cachedEntry)
-	assert.Equal(t, 1, cachedEntry.CachedSet.Len())
+	assert.NotNil(t, cachedSet)
+	assert.Equal(t, 1, cachedSet.Len())
 }
 
 func TestJWKSet(t *testing.T) {
@@ -830,11 +831,12 @@ func TestJWKSet(t *testing.T) {
 	assert.Equal(t, User{ID: "ggicci"}, gotUser)
 
 	// Vérifier que le cache a été créé correctement
-	assert.NotNil(t, ja.jwkCaches)
-	cachedEntry, exists := ja.jwkCaches[TestJWKSetURL]
+	assert.NotNil(t, ja.jwkCache)
+	assert.NotNil(t, ja.jwkCacheSets)
+	cachedSet, exists := ja.jwkCacheSets[TestJWKSetURL]
 	assert.True(t, exists, "Le cache devrait exister pour l'URL du set JWK")
-	assert.NotNil(t, cachedEntry)
-	assert.Equal(t, 2, cachedEntry.CachedSet.Len())
+	assert.NotNil(t, cachedSet)
+	assert.Equal(t, 2, cachedSet.Len())
 }
 
 func TestJWKSet_KeyNotFound(t *testing.T) {
@@ -855,11 +857,12 @@ func TestJWKSet_KeyNotFound(t *testing.T) {
 	gotUser, authenticated, err := ja.Authenticate(rw, r)
 
 	// Vérifier que le cache a été créé correctement
-	assert.NotNil(t, ja.jwkCaches)
-	cachedEntry, exists := ja.jwkCaches[TestJWKSetURLInapplicable]
+	assert.NotNil(t, ja.jwkCache)
+	assert.NotNil(t, ja.jwkCacheSets)
+	cachedSet, exists := ja.jwkCacheSets[TestJWKSetURLInapplicable]
 	assert.True(t, exists, "Le cache devrait exister pour l'URL inapplicable")
-	assert.NotNil(t, cachedEntry)
-	assert.Equal(t, 2, cachedEntry.CachedSet.Len())
+	assert.NotNil(t, cachedSet)
+	assert.Equal(t, 2, cachedSet.Len())
 
 	// Vérifier que l'authentification a échoué car la clé n'est pas trouvée
 	assert.Error(t, err)

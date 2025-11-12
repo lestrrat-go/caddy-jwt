@@ -17,10 +17,12 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/caddyauth"
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jws"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/httprc/v3"
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v3/jws"
+	"github.com/lestrrat-go/jwx/v3/jwt"
+	"github.com/lestrrat-go/jwx/v3/transform"
 	"go.uber.org/zap"
 )
 
@@ -30,23 +32,6 @@ func init() {
 
 type User = caddyauth.User
 type Token = jwt.Token
-
-// jwkCacheEntry stores the JWK cache information for a specific URL
-type jwkCacheEntry struct {
-	URL       string
-	Cache     *jwk.Cache
-	CachedSet jwk.Set
-}
-
-// refresh refreshes the JWK cache for this entry
-func (entry *jwkCacheEntry) refresh(ctx context.Context, logger *zap.Logger) error {
-	_, err := entry.Cache.Refresh(ctx, entry.URL)
-	if err != nil {
-		logger.Warn("failed to refresh JWK cache", zap.Error(err), zap.String("url", entry.URL))
-		return err
-	}
-	return nil
-}
 
 // JWTAuth facilitates JWT (JSON Web Token) authentication.
 type JWTAuth struct {
@@ -168,8 +153,11 @@ type JWTAuth struct {
 	logger        *zap.Logger
 	parsedSignKey interface{} // can be []byte, *rsa.PublicKey, *ecdsa.PublicKey, etc.
 
-	// JWK cache by resolved URL to support placeholders in JWKURL
-	jwkCaches map[string]*jwkCacheEntry
+	// Shared JWK cache for all URLs
+	jwkCache *jwk.Cache
+
+	// Map of URL -> jwk.CachedSet for each registered URL
+	jwkCacheSets map[string]jwk.CachedSet
 
 	mutex sync.RWMutex
 }
@@ -185,12 +173,50 @@ func (JWTAuth) CaddyModule() caddy.ModuleInfo {
 // Provision implements caddy.Provisioner interface.
 func (ja *JWTAuth) Provision(ctx caddy.Context) error {
 	ja.logger = ctx.Logger(ja)
+
+	if ja.JWKURL != "" {
+		httpClient := httprc.NewClient(
+			httprc.WithErrorSink(ja),
+		)
+
+		cache, err := jwk.NewCache(ctx, httpClient)
+		if err != nil {
+			return fmt.Errorf("failed to create JWK cache: %w", err)
+		}
+
+		ja.jwkCache = cache
+		ja.jwkCacheSets = make(map[string]jwk.CachedSet)
+
+		ja.logger.Info("JWK cache initialized", zap.String("jwk_url", ja.JWKURL))
+	}
+
 	return nil
 }
 
-// Error implements httprc.ErrSink interface.
+// Cleanup implements caddy.CleanerUpper interface.
+// Called when the module is being replaced or server is shutting down.
+// This ensures the JWK cache background goroutines are properly stopped.
+func (ja *JWTAuth) Cleanup() error {
+	if ja.jwkCache == nil {
+		return nil
+	}
+
+	// Shut down the cache with a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := ja.jwkCache.Shutdown(ctx); err != nil {
+		ja.logger.Error("failed to shutdown JWK cache", zap.Error(err))
+		return fmt.Errorf("failed to shutdown JWK cache: %w", err)
+	}
+
+	ja.logger.Info("JWK cache shutdown completed")
+	return nil
+}
+
+// Put implements httprc.ErrorSink interface (errsink.Interface).
 // It is used to log the error message provided by other modules, e.g. jwk.
-func (ja *JWTAuth) Error(err error) {
+func (ja *JWTAuth) Put(ctx context.Context, err error) {
 	ja.logger.Error("error", zap.Error(err))
 }
 
@@ -198,65 +224,77 @@ func (ja *JWTAuth) usingJWK() bool {
 	return ja.SignKey == "" && ja.JWKURL != ""
 }
 
-func (ja *JWTAuth) setupJWKLoader() {
-	// Initialize cache for all possible URLs
-	ja.mutex.Lock()
-	ja.jwkCaches = make(map[string]*jwkCacheEntry)
-	ja.mutex.Unlock()
-	ja.logger.Info("JWK cache initialized for JWK URL", zap.String("jwk_url", ja.JWKURL))
-}
-
-// getOrCreateJWKCache retrieves or creates a cache for a specific JWK URL
-func (ja *JWTAuth) getOrCreateJWKCache(resolvedURL string) (*jwkCacheEntry, error) {
-	// If the URL is empty, return an error
+// getOrRegisterCachedSet ensures the URL is registered with the cache
+// and returns its CachedSet. This handles placeholder resolution by
+// registering each unique resolved URL with the shared cache.
+func (ja *JWTAuth) getOrRegisterCachedSet(resolvedURL string) (jwk.CachedSet, error) {
 	if resolvedURL == "" {
 		return nil, fmt.Errorf("resolved JWK URL is empty")
 	}
 
-	// First, check if cache already exists for this URL using a read lock
-	ja.mutex.RLock()
-	entry, ok := ja.jwkCaches[resolvedURL]
-	ja.mutex.RUnlock()
+	// Lazy initialization: if cache doesn't exist, create it now
+	// This handles cases where Provision() wasn't called (e.g., tests)
+	if ja.jwkCache == nil {
+		ja.mutex.Lock()
+		if ja.jwkCache == nil {
+			httpClient := httprc.NewClient(
+				httprc.WithErrorSink(ja),
+			)
 
-	if ok {
-		return entry, nil
+			cache, err := jwk.NewCache(context.Background(), httpClient)
+			if err != nil {
+				ja.mutex.Unlock()
+				return nil, fmt.Errorf("failed to create JWK cache: %w", err)
+			}
+
+			ja.jwkCache = cache
+			ja.jwkCacheSets = make(map[string]jwk.CachedSet)
+
+			ja.logger.Info("JWK cache lazy initialized", zap.String("jwk_url", ja.JWKURL))
+		}
+		ja.mutex.Unlock()
 	}
 
-	// If not found, acquire a write lock to create a new entry
+	// Fast path: check if already registered
+	ja.mutex.RLock()
+	if cachedSet, ok := ja.jwkCacheSets[resolvedURL]; ok {
+		ja.mutex.RUnlock()
+		return cachedSet, nil
+	}
+	ja.mutex.RUnlock()
+
+	// If not found, acquire a write lock to register
 	ja.mutex.Lock()
 	defer ja.mutex.Unlock()
 
-	// Double-check if another goroutine created the cache while we were waiting for the lock
-	if entry, ok := ja.jwkCaches[resolvedURL]; ok {
-		return entry, nil
+	// Double-check after acquiring write lock
+	if cachedSet, ok := ja.jwkCacheSets[resolvedURL]; ok {
+		return cachedSet, nil
 	}
 
-	// Create a new cache for this URL
-	cache := jwk.NewCache(context.Background(), jwk.WithErrSink(ja))
-	err := cache.Register(resolvedURL)
+	// Register the URL with the shared cache
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err := ja.jwkCache.Register(ctx, resolvedURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register JWK URL: %w", err)
 	}
 
-	// Create cache entry before attempting refresh
-	entry = &jwkCacheEntry{
-		URL:       resolvedURL,
-		Cache:     cache,
-		CachedSet: jwk.NewCachedSet(cache, resolvedURL),
-	}
-
-	// Try to refresh the cache immediately
-	err = entry.refresh(context.Background(), ja.logger)
+	// Get the cached set for this URL
+	cachedSet, err := ja.jwkCache.CachedSet(resolvedURL)
 	if err != nil {
-		ja.logger.Warn("failed to refresh JWK cache during initialization", zap.Error(err), zap.String("url", resolvedURL))
-		// Continue even in case of error, the important thing is that the URL is registered
+		return nil, fmt.Errorf("failed to get cached set: %w", err)
 	}
 
-	// Register the entry in the cache
-	ja.jwkCaches[resolvedURL] = entry
-	ja.logger.Info("new JWK cache created", zap.String("url", resolvedURL), zap.Int("loaded_keys", entry.CachedSet.Len()))
+	// Store in map
+	ja.jwkCacheSets[resolvedURL] = cachedSet
 
-	return entry, nil
+	ja.logger.Info("Registered new JWK URL",
+		zap.String("url", resolvedURL),
+		zap.Int("total_urls", len(ja.jwkCacheSets)))
+
+	return cachedSet, nil
 }
 
 // Validate implements caddy.Validator interface.
@@ -282,26 +320,22 @@ func (ja *JWTAuth) Validate() error {
 
 func (ja *JWTAuth) validateSignatureKeys() error {
 	if ja.usingJWK() {
-		// Initialize the cache structure without attempting to resolve placeholders
-		// URLs will be resolved during usage
-		ja.setupJWKLoader()
+		return nil
+	}
+	if keyBytes, asymmetric, err := parseSignKey(ja.SignKey); err != nil {
+		// Key(step 1): base64 -> raw bytes.
+		return fmt.Errorf("invalid sign_key: %w", err)
 	} else {
-		if keyBytes, asymmetric, err := parseSignKey(ja.SignKey); err != nil {
-			// Key(step 1): base64 -> raw bytes.
-			return fmt.Errorf("invalid sign_key: %w", err)
-		} else {
-			// Key(step 2): raw bytes -> parsed key.
-			if !asymmetric {
-				ja.parsedSignKey = keyBytes
-			} else if ja.parsedSignKey, err = x509.ParsePKIXPublicKey(keyBytes); err != nil {
-				return fmt.Errorf("invalid sign_key (asymmetric): %w", err)
-			}
+		// Key(step 2): raw bytes -> parsed key.
+		if !asymmetric {
+			ja.parsedSignKey = keyBytes
+		} else if ja.parsedSignKey, err = x509.ParsePKIXPublicKey(keyBytes); err != nil {
+			return fmt.Errorf("invalid sign_key (asymmetric): %w", err)
+		}
 
-			if ja.SignAlgorithm != "" {
-				var alg jwa.SignatureAlgorithm
-				if err := alg.Accept(ja.SignAlgorithm); err != nil {
-					return fmt.Errorf("%w: %v", ErrInvalidSignAlgorithm, err)
-				}
+		if ja.SignAlgorithm != "" {
+			if _, ok := jwa.LookupSignatureAlgorithm(ja.SignAlgorithm); !ok {
+				return fmt.Errorf("%w: %s", ErrInvalidSignAlgorithm, ja.SignAlgorithm)
 			}
 		}
 	}
@@ -322,35 +356,71 @@ func (ja *JWTAuth) keyProvider(request *http.Request) jws.KeyProviderFunc {
 
 			ja.logger.Info("JWK URL", zap.String("unresolved", ja.JWKURL), zap.String("resolved", resolvedURL))
 
-			// Get or create the cache for this URL
-			cacheEntry, err := ja.getOrCreateJWKCache(resolvedURL)
+			// Get or register the cached set for this URL
+			cachedSet, err := ja.getOrRegisterCachedSet(resolvedURL)
 			if err != nil {
-				return fmt.Errorf("failed to get JWK cache: %w", err)
+				return fmt.Errorf("failed to get JWK set: %w", err)
 			}
 
 			// Use the key set associated with this URL
-			kid := sig.ProtectedHeaders().KeyID()
-			key, found := cacheEntry.CachedSet.LookupKeyID(kid)
+			kid, _ := sig.ProtectedHeaders().KeyID()
+			key, found := cachedSet.LookupKeyID(kid)
 			if !found {
-				// Trigger an asynchronous refresh if the key is not found
-				go cacheEntry.refresh(context.Background(), ja.logger)
+				// Trigger immediate refresh to fetch potentially rotated keys
+				go func() {
+					refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
 
+					if _, err := ja.jwkCache.Refresh(refreshCtx, resolvedURL); err != nil {
+						ja.logger.Warn("failed to refresh JWK cache on key miss",
+							zap.Error(err),
+							zap.String("url", resolvedURL),
+							zap.String("kid", kid))
+					} else {
+						ja.logger.Info("refreshed JWK cache after key miss",
+							zap.String("url", resolvedURL),
+							zap.String("kid", kid))
+					}
+				}()
+
+				// Return error for current request (subsequent requests will use refreshed keys)
 				if kid == "" {
 					return fmt.Errorf("missing kid in JWT header")
 				}
 				return fmt.Errorf("key specified by kid %q not found in JWKs from %s", kid, resolvedURL)
 			}
-			sink.Key(ja.determineSigningAlgorithm(key.Algorithm(), sig.ProtectedHeaders().Algorithm()), key)
-		} else if ja.SignAlgorithm == string(jwa.EdDSA) {
+			keyAlg, keyAlgOk := key.Algorithm()
+			sigAlg, sigAlgOk := sig.ProtectedHeaders().Algorithm()
+
+			var finalAlg jwa.SignatureAlgorithm
+			if keyAlgOk && keyAlg.String() != "" {
+				if sa, ok := jwa.LookupSignatureAlgorithm(keyAlg.String()); ok {
+					finalAlg = sa
+				}
+			} else if sigAlgOk {
+				finalAlg = sigAlg
+			} else {
+				finalAlg = ja.determineSigningAlgorithm()
+			}
+
+			sink.Key(finalAlg, key)
+		} else if ja.SignAlgorithm == jwa.EdDSA().String() {
 			if signKey, ok := ja.parsedSignKey.([]byte); !ok {
 				return fmt.Errorf("EdDSA key must be base64 encoded bytes")
 			} else if len(signKey) != ed25519.PublicKeySize {
 				return fmt.Errorf("key is not a proper ed25519 length")
 			} else {
-				sink.Key(jwa.EdDSA, ed25519.PublicKey(signKey))
+				sink.Key(jwa.EdDSA(), ed25519.PublicKey(signKey))
 			}
 		} else {
-			sink.Key(ja.determineSigningAlgorithm(sig.ProtectedHeaders().Algorithm()), ja.parsedSignKey)
+			sigAlg, sigAlgOk := sig.ProtectedHeaders().Algorithm()
+			var finalAlg jwa.SignatureAlgorithm
+			if sigAlgOk {
+				finalAlg = sigAlg
+			} else {
+				finalAlg = ja.determineSigningAlgorithm()
+			}
+			sink.Key(finalAlg, ja.parsedSignKey)
 		}
 		return nil
 	}
@@ -358,11 +428,20 @@ func (ja *JWTAuth) keyProvider(request *http.Request) jws.KeyProviderFunc {
 
 func (ja *JWTAuth) determineSigningAlgorithm(alg ...jwa.KeyAlgorithm) jwa.SignatureAlgorithm {
 	for _, a := range alg {
-		if a.String() != "" {
-			return jwa.SignatureAlgorithm(a.String())
+		algStr := a.String()
+		if algStr != "" {
+			if sigAlg, ok := jwa.LookupSignatureAlgorithm(algStr); ok {
+				return sigAlg
+			}
 		}
 	}
-	return jwa.SignatureAlgorithm(ja.SignAlgorithm) // can be ""
+	if ja.SignAlgorithm != "" {
+		if sigAlg, ok := jwa.LookupSignatureAlgorithm(ja.SignAlgorithm); ok {
+			return sigAlg
+		}
+	}
+	// might want to return an error if we got here?
+	return jwa.SignatureAlgorithm{}
 }
 
 // Authenticate validates the JWT in the request and returns the user, if valid.
@@ -499,10 +578,13 @@ func getTokensFromCookies(r *http.Request, names []string) []string {
 
 func getUserID(token Token, names []string) (string, string) {
 	for _, name := range names {
-		if userClaim, ok := token.Get(name); ok {
+		var userClaim any
+		if err := token.Get(name, &userClaim); err == nil && userClaim != nil {
 			switch val := userClaim.(type) {
 			case string:
-				return name, val
+				if val != "" {
+					return name, val
+				}
 			case float64:
 				return name, strconv.FormatFloat(val, 'f', -1, 64)
 			}
@@ -531,10 +613,18 @@ func getUserMetadata(token Token, placeholdersMap map[string]string) map[string]
 		return nil
 	}
 
-	claims, _ := token.AsMap(context.Background()) // error ignored
+	// Use transform.AsMap to convert token to map
+	claims := make(map[string]any)
+	if err := transform.AsMap(token, claims); err != nil {
+		// If AsMap fails, continue with empty claims map
+		claims = make(map[string]any)
+	}
+
 	metadata := make(map[string]string)
 	for claim, placeholder := range placeholdersMap {
-		claimValue, ok := token.Get(claim)
+		var claimValue any
+		err := token.Get(claim, &claimValue)
+		ok := err == nil && claimValue != nil
 
 		// Query nested claims.
 		if !ok && strings.Contains(claim, ".") {
